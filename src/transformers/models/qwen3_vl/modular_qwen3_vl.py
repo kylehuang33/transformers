@@ -61,6 +61,7 @@ from ..qwen3.modeling_qwen3 import (
     apply_rotary_pos_emb,
     eager_attention_forward,
 )
+from .bg_layer import bgridVideoTokenCompress, construct_3d_coords
 
 
 logger = logging.get_logger(__name__)
@@ -275,6 +276,17 @@ class Qwen3VLConfig(PreTrainedConfig):
         vision_start_token_id=151652,
         vision_end_token_id=151653,
         tie_word_embeddings=False,
+        # Token compression parameters (similar to InternVL)
+        use_token_compression=False,
+        gm_cs=4,
+        s_r=4,
+        s_s=1,
+        base_t=10000.0,
+        base_s=10000.0,
+        use_3d_rope=True,
+        use_value_mlp=True,
+        alpha=0.0,
+        gram_weight=0.01,
         **kwargs,
     ):
         if isinstance(vision_config, dict):
@@ -291,6 +303,19 @@ class Qwen3VLConfig(PreTrainedConfig):
         self.video_token_id = video_token_id
         self.vision_start_token_id = vision_start_token_id
         self.vision_end_token_id = vision_end_token_id
+        
+        # Token compression parameters
+        self.use_token_compression = use_token_compression
+        self.gm_cs = gm_cs
+        self.s_r = s_r
+        self.s_s = s_s
+        self.base_t = base_t
+        self.base_s = base_s
+        self.use_3d_rope = use_3d_rope
+        self.use_value_mlp = use_value_mlp
+        self.alpha = alpha
+        self.gram_weight = gram_weight
+        
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
 
 
@@ -819,6 +844,69 @@ class Qwen3VLModel(Qwen2_5_VLModel):
         super().__init__(config)
         self.visual = Qwen3VLVisionModel._from_config(config.vision_config)
         self.language_model = Qwen3VLTextModel._from_config(config.text_config)
+        
+        # Initialize token compression module if enabled (similar to InternVL)
+        self.use_token_compression = getattr(config, 'use_token_compression', False)
+        if self.use_token_compression:
+            # Calculate image size - will be determined dynamically from grid_thw
+            # For now use a default, but actual size will be computed per image
+            # The compression module's img_size parameter is used for the spatial dimensions
+            # after spatial merge, which we'll determine from grid_thw
+            llm_hidden_size = config.text_config.hidden_size
+            
+            # We'll create compression module dynamically per call, but store config
+            self.compress_config = {
+                'gm_cs': getattr(config, 'gm_cs', 4),
+                's_r': getattr(config, 's_r', 4),
+                's_s': getattr(config, 's_s', 1),
+                'llm_hidden_size': llm_hidden_size,
+                'base_t': getattr(config, 'base_t', 10000.0),
+                'base_s': getattr(config, 'base_s', 10000.0),
+                'use_3d_rope': getattr(config, 'use_3d_rope', True),
+                'use_value_mlp': getattr(config, 'use_value_mlp', True),
+                'alpha': getattr(config, 'alpha', 0.0),
+            }
+            self.num_image_token = int(self.compress_config['s_r']**self.compress_config['gm_cs'] * self.compress_config['s_s']**2)
+        else:
+            self.compress_config = None
+            self.num_image_token = None
+
+    def compute_compressed_grid_thw(self, grid_thw: torch.LongTensor) -> torch.LongTensor:
+        """
+        Compute compressed grid_thw based on compression parameters.
+        This should be used BEFORE calling the processor to ensure the correct number of placeholder tokens.
+        
+        Args:
+            grid_thw: Original grid_thw with shape (num_images, 3) where 3 = (t, h, w)
+            
+        Returns:
+            Compressed grid_thw with updated h, w dimensions
+        """
+        if not self.use_token_compression or self.compress_config is None:
+            return grid_thw
+        
+        spatial_merge_size = self.visual.spatial_merge_size
+        num_compressed_tokens = self.num_image_token
+        
+        compressed_grid_thw = []
+        for i in range(grid_thw.shape[0]):
+            t, h, w = grid_thw[i][0].item(), grid_thw[i][1].item(), grid_thw[i][2].item()
+            h_merged = h // spatial_merge_size
+            w_merged = w // spatial_merge_size
+            
+            # After compression, we have num_compressed_tokens per frame
+            # We need to represent this as new h, w dimensions
+            # For simplicity, use square: h_new = w_new = sqrt(num_compressed_tokens)
+            # But we need to account for spatial_merge_size when converting back
+            tokens_per_frame = num_compressed_tokens
+            h_new = w_new = int(tokens_per_frame ** 0.5)
+            # Convert back to original scale (multiply by spatial_merge_size)
+            h_new_orig = h_new * spatial_merge_size
+            w_new_orig = w_new * spatial_merge_size
+            
+            compressed_grid_thw.append([t, h_new_orig, w_new_orig])
+        
+        return torch.tensor(compressed_grid_thw, dtype=grid_thw.dtype, device=grid_thw.device)
 
     def get_rope_index(
         self,
@@ -953,6 +1041,57 @@ class Qwen3VLModel(Qwen2_5_VLModel):
         image_embeds, deepstack_image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
+        
+        # Apply token compression if enabled (similar to InternVL's generate method)
+        if self.use_token_compression and self.compress_config is not None and image_grid_thw is not None:
+            compressed_embeds = []
+            spatial_merge_size = self.visual.spatial_merge_size
+            
+            for i, embed in enumerate(image_embeds):
+                t, h, w = image_grid_thw[i][0].item(), image_grid_thw[i][1].item(), image_grid_thw[i][2].item()
+                # Calculate dimensions after spatial merge
+                h_merged = h // spatial_merge_size
+                w_merged = w // spatial_merge_size
+                
+                # Reshape embed to (t, h_merged, w_merged, hidden_size)
+                # embed currently has shape (t * h_merged * w_merged, hidden_size)
+                embed_reshaped = embed.view(t, h_merged, w_merged, -1)
+                embed_reshaped = embed_reshaped.view(t, h_merged * w_merged, -1)  # (t, h*w, c)
+                
+                # Create compression module for this specific image size
+                cur_compress = bgridVideoTokenCompress(
+                    img_size=(h_merged, w_merged),
+                    gm_cs=self.compress_config['gm_cs'],
+                    s_r=self.compress_config['s_r'],
+                    s_s=self.compress_config['s_s'],
+                    llm_hidden_size=self.compress_config['llm_hidden_size'],
+                    base_t=self.compress_config['base_t'],
+                    base_s=self.compress_config['base_s'],
+                    use_3d_rope=self.compress_config['use_3d_rope'],
+                    use_value_mlp=self.compress_config['use_value_mlp'],
+                    alpha=self.compress_config['alpha'],
+                ).to(torch.bfloat16).to(embed.device)
+                
+                # Construct 3D coordinates (similar to InternVL)
+                thw_coords = construct_3d_coords(t, h_merged, w_merged, embed.device)
+                thw_coords = thw_coords.view(t, h_merged * w_merged, 3).contiguous().to(embed.dtype)
+                
+                # Apply compression
+                num_patches_list = [t]  # Single image with t frames
+                compressed, _ = cur_compress(
+                    embed_reshaped,
+                    num_patches_list=num_patches_list,
+                    thw_coords=thw_coords,
+                    print_key_distribution=False,
+                    key_optimize=False,
+                )
+                # compressed has shape (t, num_compressed_tokens, hidden_size)
+                # Flatten to (t * num_compressed_tokens, hidden_size)
+                compressed = compressed.view(-1, compressed.shape[-1])
+                compressed_embeds.append(compressed)
+            
+            image_embeds = compressed_embeds
+        
         return image_embeds, deepstack_image_embeds
 
     def get_video_features(
